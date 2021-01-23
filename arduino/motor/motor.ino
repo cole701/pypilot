@@ -27,7 +27,7 @@ D4  D5
  1   1        .05 ohm, (or .001 ohm x 50 gain)
  0   1        .01 ohm
  1   0        .0005 ohm x 50 gain
- 0   0        .0005 ohm x 200 gain   *ratiometric mode
+ 0   0        .00025 ohm x 200 gain   *ratiometric mode
 
 
 digital pin6 determines:
@@ -130,39 +130,36 @@ PWR+             VIN
 
 static volatile uint8_t timer1_state;
 
-#if DIV_CLOCK==4
-#define dead_time \
+// 1.5uS
+#define dead_time4 \
+    asm volatile ("nop"); \
+    asm volatile ("nop"); \
+    asm volatile ("nop"); \
+    asm volatile ("nop"); \
     asm volatile ("nop"); \
     asm volatile ("nop");
+
+#if DIV_CLOCK==4
+#define dead_time dead_time4
 #elif DIV_CLOCK==2
 #define dead_time \
-    asm volatile ("nop"); \
-    asm volatile ("nop"); \
-    asm volatile ("nop"); \
-    asm volatile ("nop"); \
-    asm volatile ("nop");
+    dead_time4 \
+    dead_time4
 #elif DIV_CLOCK==1
 #define dead_time \
-    asm volatile ("nop"); \
-    asm volatile ("nop"); \
-    asm volatile ("nop"); \
-    asm volatile ("nop"); \
-    asm volatile ("nop"); \
-    asm volatile ("nop"); \
-    asm volatile ("nop"); \
-    asm volatile ("nop"); \
-    asm volatile ("nop");
+    dead_time4 \
+    dead_time4 \
+    dead_time4 \
+    dead_time4
 #warning "DIV_CLOCK set to 1, this will only work with 16mhz xtal"
 #else
 #error "invalid DIV_CLOCK"
 #endif
 
 
-// time to charge bootstrap capacitor
+// time to charge bootstrap capacitor twice dead time
 #define charge_time \
-        dead_time;
-        dead_time;
-        dead_time;
+        dead_time; \
         dead_time;
 
 #define shunt_sense_pin 4 // use pin 4 to specify shunt resistance
@@ -302,10 +299,14 @@ uint8_t eeprom_read_end = 0;
 
 uint8_t adcref = _BV(REFS0)| _BV(REFS1); // 1.1v
 volatile uint8_t calculated_clock = 0; // must be volatile to work correctly
-uint16_t clock_time;
+uint8_t timeout;
+uint16_t serial_data_timeout;
 
 void setup()
 {
+    PCICR = 0;
+    PCMSK2 = 0;
+        
     cli(); // disable interrupts
     CLKPR = _BV(CLKPCE);
     CLKPR = _BV(CLKPS1); // divide clock by 4
@@ -320,7 +321,7 @@ void setup()
 
     uint32_t start = micros();
     while(!calculated_clock);  // wait for watchdog to fire
-    clock_time = micros() - start;
+    uint16_t clock_time = micros() - start;
     uint8_t div_board = 1; // 1 for 16mhz
     if(clock_time < 2900) // 1800-2600 is 8mhz, 3800-4600 is 16mhz
         div_board = 2; // detected 8mhz crystal, otherwise assume 16mhz
@@ -379,8 +380,6 @@ void setup()
     // set up Serial library
     Serial.begin(38400*DIV_CLOCK);
 
-    set_sleep_mode(SLEEP_MODE_IDLE); // wait for serial
-
     digitalWrite(A0, LOW);
     pinMode(A0, OUTPUT);
     voltage_sense = digitalRead(voltage_sense_pin);
@@ -418,6 +417,31 @@ void setup()
         digitalWrite(pwm_output_pin, LOW); /* enable internal pullups */
         pinMode(pwm_output_pin, OUTPUT);
     }
+
+#if defined(__AVR_ATmega328pb__)
+    // read device signature bytes to identify processor
+    uint8_t sig[3], c = 0;
+    for (uint8_t i = 0; i < 5; i += 2)
+        sig[c++] = Serial.print(boot_signature_byte_get(i));
+    if(0/*disable for now*/   &&   sig[0] == 0x1e && sig[1] == 0x95 && sig[2] == 0x16) {
+        // detected atmega328pb processor, we have timers 3 and 4 with hardware pwm possible
+        if(pwm_style == 0) {
+            // upgrade to use hardware pwm (style 3)
+            pwm_style = 3;
+            // use timers 1, 2, 3 for pwm (with deadtime)
+            // use timer 4 in place of timer 2 for count
+            // stop all timers
+            GTCCR = (1<<TSM)|(1<<PSRASY)|(1<<PSRSYNC); // halt all timers
+            ICR1 = 0x255; // use timer1 as 8 bit timer
+            ICR4 = 0x255; // use timer2 also as 8 bit timer
+            TCNT1 = 0;
+            TCNT2 = 10; // deadtime
+            TCNT3 = 10;
+            GTCCR = 0; // restart timers 
+        }
+    }
+#endif    
+    
     // test shunt type, if pin wired to ground, we have 0.01 ohm, otherwise 0.05 ohm
     shunt_resistance = digitalRead(shunt_sense_pin);
 
@@ -428,7 +452,7 @@ void setup()
 
     // setup adc
     DIDR0 = 0x3f; // disable all digital io on analog pins
-    if(pwm_style == 2 || ratiometric_mode)
+    if(ratiometric_mode)
         adcref = _BV(REFS0); // 5v
     else
         adcref = _BV(REFS0)| _BV(REFS1); // 1.1v
@@ -440,6 +464,21 @@ void setup()
 #endif
     ADCSRA |= _BV(ADPS0) |  _BV(ADPS1) | _BV(ADPS2); // divide clock by 128
     ADCSRA |= _BV(ADSC); // start conversion
+
+    timeout = 0;
+#if defined(__AVR_ATmega328pb__)
+    if(pwm_style == 3) {
+        TCNT4 = 0;
+        /// fix this TCCR4B = _BV(CS22) | _BV(CS21) | _BV(CS20); // divide 1024
+        // use timer5 as timeout
+    } else
+#endif        
+    {
+        // use timer2 as timeout
+        TCNT2 = 0;
+        TCCR2B = _BV(CS22) | _BV(CS21) | _BV(CS20); // divide 1024
+    }
+    serial_data_timeout = 250;
 }
 
 uint8_t in_bytes[3];
@@ -448,7 +487,6 @@ uint8_t sync_b = 0, in_sync_count = 0;
 uint8_t out_sync_b = 0, out_sync_pos = 0;
 uint8_t crcbytes[3];
 
-uint8_t timeout;
 uint8_t rudder_sense = 0;
 
 // command is from 0 to 2000 with 1000 being neutral
@@ -461,7 +499,7 @@ void position(uint16_t value)
         OCR1A = 1500/DIV_CLOCK + value * 3 / 2 / DIV_CLOCK;
     //OCR1A = 1350/DIV_CLOCK + value * 27 / 20 / DIV_CLOCK;
     else if(pwm_style == 2) {
-        OCR1A = abs((int)value - 1000) * DIV_CLOCK;
+        OCR1A = abs((int)value - 1000) * 16 / DIV_CLOCK;
         if(value > 1040) {
             a_bottom_off;
             b_bottom_on;
@@ -479,10 +517,7 @@ void position(uint16_t value)
         // but the current through the motor remains continuous
         if(value > 1100) {
             if(value > 1900) {
-                if(low_current)
-                    ICR1_u=64000;  //fPWM=62.5hz, 125hz, or 250hz
-                else
-                    ICR1_u=16000;  //faster frequency for high current board
+                ICR1_u=64000;  //fPWM=62.5hz, 125hz, or 250hz
 #if 0
                 OCR1A_u = 120; // 99.8% duty cycle (not used anymore)
                 timer1_state = 1;
@@ -500,10 +535,7 @@ void position(uint16_t value)
 
         } else if(value < 900) {
             if(value < 100) {
-                if(low_current)
-                    ICR1_u=64000;  //fPWM=62.5hz, 125hz, or 250hz
-                else
-                    ICR1_u=16000;  //faster frequency for high current board
+                ICR1_u=64000;  //fPWM=62.5hz, 125hz, or 250hz
 #if 0
                 OCR1B_u = 120;  // using old state, 80/64000 = .99875 deadtime
                 timer1_state = 2;
@@ -565,6 +597,7 @@ void stop_starboard()
 void update_command()
 {
     int16_t speed_rate = max_slew_speed;
+
     // value of 20 is 1 second full range at 50hz
     int16_t slow_rate = max_slew_slow;
 
@@ -596,34 +629,38 @@ void update_command()
 void disengage()
 {
     stop();
-    flags &= ~ENGAGED;
-    timeout = 120/DIV_CLOCK+1; // detach in about 62ms
+    if(flags | ENGAGED) {
+        flags &= ~ENGAGED;
+        timeout = 30; // detach in about 62ms
+    }
     digitalWrite(clutch_pin, LOW); // clutch
 }
 
 void detach()
 {
+    TIMSK1 = 0;
+    TCCR1A=0;
+    TCCR1B=0;
     if(pwm_style) {
-        TCCR1A=0;
-        TCCR1B=0;
         while(digitalRead(pwm_output_pin)); // wait for end of pwm if pulse is high
-        TIMSK1 = 0;
         if(pwm_style == 2) {
             a_bottom_off;
             b_bottom_off;
             digitalWrite(enable_pin, LOW);
         }
     } else {
-        TCCR1A=0;
-        TCCR1B=0;
         timer1_state = 0;
-        TIMSK1 = 0;
         a_top_off;
         a_bottom_off;
         b_top_off;
         b_bottom_off;
     }
-    TIMSK2 = 0;
+#if defined(__AVR_ATmega328pb__)
+    if(pwm_style == 3)
+        TIMSK4 = 0;
+    else
+#endif
+        TIMSK2 = 0;
 
 #ifdef BLINK
     static uint32_t led_blink;
@@ -638,7 +675,7 @@ void detach()
     digitalWrite(led_pin, LOW); // status LED
 #endif
     
-    timeout = 128/DIV_CLOCK; // avoid overflow
+    timeout = 33; // avoid overflow
 }
 
 void engage()
@@ -670,7 +707,7 @@ void engage()
 
         pinMode(hbridge_a_bottom_pin, OUTPUT);
         pinMode(hbridge_b_bottom_pin, OUTPUT);
-        pinMode(enable_pin, INPUT);
+        pinMode(enable_pin, OUTPUT);
 
         digitalWrite(enable_pin, HIGH);
     } else {
@@ -696,11 +733,6 @@ void engage()
     position(1000);
     digitalWrite(clutch_pin, HIGH); // clutch
     digitalWrite(led_pin, HIGH); // status LED
-
-// use timer2 as timeout
-    timeout = 0;
-    TCNT2 = 0;
-    TCCR2B = _BV(CS22) | _BV(CS21) | _BV(CS20); // divide 1024
 
     flags |= ENGAGED;
 }
@@ -869,10 +901,11 @@ uint16_t TakeVolts(uint8_t p)
         v = v * 14135 / 3584 / 16;
     else if(ratiometric_mode) {
         // 100.0/1024*115000/15000*5.0
-        v = v * 719 / 192 / 16;
+        v = v * 1439 / 384 / 16;
     } else
         // 1815 / 896 = 100.0/1024*10560/560*1.1
-        v = v * 1815 / 896 / 16;
+        //    v = v * 1815 / 896 / 16;
+    v = v * 1790 / 896 / 16; // hack closer to actual voltage
 
     return v;
 }
@@ -1060,8 +1093,8 @@ void process_packet()
         }
         break;
     case MAX_CURRENT_CODE: { // current in units of 10mA
-        unsigned int max_max_current = low_current ? 2000 : 4000;
-        if(value > max_max_current) // maximum is 20 or 40 amps
+        unsigned int max_max_current = low_current ? 2000 : 5000;
+        if(value > max_max_current) // maximum is 20 or 50 amps
             value = max_max_current;
         max_current = value;
     } break;
@@ -1124,6 +1157,8 @@ void service_adc() {
     ADCSRA |= _BV(ADSC); // start conversion
 }
 #endif
+ISR(PCINT2_vect) {
+}
 
 void loop()
 {
@@ -1133,44 +1168,70 @@ void loop()
  
     // did timer2 pass 78?
     // Timer2 ticks at 3906hz (4mhz), so this is ~50hz
-    if(TCNT2 > 78) {
-        if(flags & ENGAGED) {
-            static uint8_t update_d;
-            if(++update_d >= 4/DIV_CLOCK) {
-                update_command();
-                update_d = 0;
-            }
+    uint8_t ticks;
+#if defined(__AVR_ATmega328pb__)
+    if(pwm_style == 3)
+        ticks = TCNT4;
+    else
+#endif        
+        ticks = TCNT2;
+    if(ticks > 78) {
+        static uint8_t timeout_d;
+        // divide timeout for faster clocks, timeout counts at 50hz
+        if(++timeout_d >= 4/DIV_CLOCK) {
+            if(flags & ENGAGED)
+                update_command(); // update speed changes to slew speed
+            timeout_d = 0;
+            timeout++;
+            serial_data_timeout++;
         }
-        timeout++;
-        TCNT2 -= 78;
+#if defined(__AVR_ATmega328pb__)
+        if(pwm_style == 3)
+            TCNT4 -= 78;
+        else
+#endif
+            TCNT2 -= 78;
     }
 
-    if(timeout == 120/DIV_CLOCK)
+    if(timeout == 30)
         disengage();
 
-    if(timeout >= 128/DIV_CLOCK) // detach 60 ms later so esc gets stop
+    if(timeout > 32) // detach 62 ms later so esc gets stop
         detach();
 
-    // wait for characters
-    // boot powered down, wake on data
-#if 0 // hardly worth it
-    while(ADCSRA & _BV(ADSC)) { // wait for conversion
-        set_sleep_mode(SLEEP_MODE_IDLE);
+#if 1
+    if(serial_data_timeout > 250 && timeout>32) { // no serial data for 10 seconds, enter power down
+        TCNT2 = 0;
+        
+        // make watchdog 8 seconds
+        cli();
+        WDTCSR = (1<<WDCE)|(1<<WDE);
+        WDTCSR = (1<<WDIE) | (1<<WDP3) | (1<<WDP0);
+        sei();
+#if 1 // power down not working because of noise?!?
+        PCICR |= _BV(PCIE2); // pin change interrupt
+        PCMSK2 = _BV(PD0); // rx
+        set_sleep_mode(SLEEP_MODE_PWR_DOWN);  // not working
+#else
+        set_sleep_mode(SLEEP_MODE_IDLE); // can wake from serial data
+#endif
         sleep_enable();
         sleep_cpu();
+        cli();
+        PCICR = 0;
+        PCMSK2 = 0;
+        wdt_reset();
+        WDTCSR = (1<<WDCE)|(1<<WDE); // watchdog back to 0.25 seconds
+        WDTCSR = (1<<WDIE) | (1<<WDP2);
+        sei();
+        serial_data_timeout -= 5;
     }
 #endif
 
-#if 0
-    // hack to output this command always (for testing)
-    timeout = 0;
-    command_value = 1900;
-    engage();
-#endif
-    
     // serial input
     while(Serial.available()) {
       uint8_t c = Serial.read();
+      serial_data_timeout = 0;
       service_adc();
       if(sync_b < 3) {
           in_bytes[sync_b] = c;
@@ -1214,7 +1275,7 @@ void loop()
     service_adc();
 
     // test current   2000sps @ 8mhz
-    const int react_count = 400/DIV_CLOCK; // need 400 samples for .1 reaction
+    const int react_count = 400/DIV_CLOCK;
     if(CountADC(CURRENT, 1) > react_count) {
         uint16_t amps = TakeAmps(1);
         if(amps >= max_current) {
@@ -1269,7 +1330,7 @@ void loop()
     }
     service_adc();
 
-    const int rudder_react_count = 80/DIV_CLOCK; // 400sps @ DIV_CLOCK=2 ~ approx 0.1 second reaction
+    const int rudder_react_count = 100/DIV_CLOCK; // 400sps @ DIV_CLOCK=2 ~ approx 0.125 second reaction
     if(CountADC(RUDDER, 1) > rudder_react_count) {
         uint16_t v = TakeRudder(1);
         if(rudder_sense) {
@@ -1286,10 +1347,10 @@ void loop()
                 flags |= MAX_RUDDER_FAULT;
             } else
                 flags &= ~MAX_RUDDER_FAULT;
-            if(v < 1024 || v > 65472 - 1024)
+            if(v < 1024+1024 || v > 65472 - 1024)
                 rudder_sense = 0;
         } else {
-            if(v > 1536 && v < 65472 - 1536)
+            if(v > 1024+1536 && v < 65472 - 1536)
                 rudder_sense = 1;
             flags &= ~(MIN_RUDDER_FAULT | MAX_RUDDER_FAULT);
         }

@@ -7,7 +7,8 @@
 # License as published by the Free Software Foundation; either
 # version 3 of the License, or (at your option) any later version.  
 
-from __future__ import print_function
+import os, time
+
 orangepi = False
 try:
     import RPi.GPIO as GPIO
@@ -46,6 +47,7 @@ class gpio(object):
         else:
             GPIO.setmode(GPIO.BCM)
 
+
         for pin in self.pins:
             try:
                 GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -54,18 +56,20 @@ class gpio(object):
                 print('failed to open /dev/gpiomem, no permission')
                 # if failed, attempt to give current user privilege if no sudo pw
                 user = os.getenv('USER')
-                os.system('sudo chown ' + user + '/dev/gpiomem')
+                os.system('sudo chown ' + user + ' /dev/gpiomem')
                 GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
                     
             def cbr(pin):
-                self.evalkey(pin, GPIO.input(pin))
+                GPIO.input(pin)
+                time.sleep(.02)  # workaround buggy gpio
+                self.evalkey(pin, value)
 
             try:
-                GPIO.add_event_detect(pin, GPIO.BOTH, callback=cbr, bouncetime=20)
+                GPIO.add_event_detect(pin, GPIO.BOTH, callback=cbr, bouncetime=50)
             except Exception as e:
                 print('WARNING', e)        
 
-    def poll(self):                
+    def poll(self):
         for pin in self.pins:
             value = True
 
@@ -78,6 +82,9 @@ class gpio(object):
                     value = GPIO.input(pin)
 
             self.evalkey(pin, value)
+        events = self.events
+        self.events = []
+        return events
 
     def evalkey(self, pin, value):
         if value:
@@ -87,5 +94,16 @@ class gpio(object):
                 return
         else:
             self.keystate[pin] += 1
-        self.events.append(['gpio%d'%pin, self.keystate[pin]])
-        
+
+        self.events.append(('gpio%d'%pin, self.keystate[pin]))
+
+def main():
+    gp = gpio()
+    while True:
+        events = gp.poll()
+        if events:
+            print('events', events)
+        time.sleep(.1)
+            
+if __name__ == '__main__':
+    main() 

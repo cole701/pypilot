@@ -8,19 +8,24 @@
 # version 3 of the License, or (at your option) any later version.  
 
 import sys
+
+if sys.version_info[0] < 3:
+    print('pypilot requires python version 3.  python version is', sys.version)
+    exit(1)
+
 try:
     from setuptools import setup, Extension
     
 except ImportError:
     from distutils.core import setup, Extension
 
-linebuffer_module = Extension('_linebuffer',
+linebuffer_module = Extension('pypilot/linebuffer/_linebuffer',
                         sources=['pypilot/linebuffer/linebuffer.cpp', 'pypilot/linebuffer/linebuffer.i'],
                         extra_compile_args=['-Wno-unused-result'],
                         swig_opts=['-c++']
 )
 
-arduino_servo_module = Extension('_arduino_servo',
+arduino_servo_module = Extension('pypilot/arduino_servo/_arduino_servo',
                         sources=['pypilot/arduino_servo/arduino_servo.cpp', 'pypilot/arduino_servo/arduino_servo_eeprom.cpp', 'pypilot/arduino_servo/arduino_servo.i'],
                         extra_compile_args=['-Wno-unused-result'],
                         swig_opts=['-c++']
@@ -35,11 +40,11 @@ except:
         import OPi.GPIO
         ugfx_libraries=['wiringPi']
     except:
-        print('no wiring library for ugfx')
+        print('no RPi.GPIO library for ugfx')
         ugfx_libraries=[]
         ugfx_defs = []
 
-ugfx_module = Extension('_ugfx',
+ugfx_module = Extension('pypilot/hat/ugfx/_ugfx',
                         sources=['hat/ugfx/ugfx.cpp',
                                  'hat/ugfx/ugfx.i'],
                         extra_compile_args=['-Wno-unused-result'] + ugfx_defs,
@@ -58,7 +63,7 @@ for walk in os.walk('hat/locale'):
 
 from pypilot import version
 
-packages = ['pypilot', 'pypilot/pilots', 'pypilot/arduino_servo', 'ui', 'pypilot/hat', 'web', 'pypilot/linebuffer', 'hat/ugfx']
+packages = ['pypilot', 'pypilot/pilots', 'pypilot/arduino_servo', 'ui', 'hat', 'web', 'pypilot/linebuffer', 'hat/ugfx']
 try:
     from setuptools import find_packages
     packages = find_packages()
